@@ -8,7 +8,7 @@ class RSAWrapper: NSObject {
         case RSA512 = 512
         case RSA1024 = 1024
         case RSA2048 = 2048
-		case RSA4096 = 4096
+        case RSA4096 = 4096
     }
 
     enum RSAErrors: Error {
@@ -21,12 +21,13 @@ class RSAWrapper: NSObject {
         case nilPlaintext
         case notsupportedCryptoAlgo
         case privateKeyCannotDecrypt
-		case noX509certificate
+        case noX509certificate
     }
 
     private var publicKey: SecKey?
     private var privateKey: SecKey?
-	private var importedPublicKey: SecKey?
+    private var importedPublicKey: SecKey?
+    private var importedPrivateKey: SecKey?
     private var generatedPair: SecKey?
     private let algorithm: SecKeyAlgorithm = .rsaEncryptionPKCS1
 
@@ -41,11 +42,17 @@ class RSAWrapper: NSObject {
         try createPrivateKey(with: privateTag)
         try createPublicKey()
     }
-	
-	convenience init(with derFilePath: String) throws {
-		self.init()
-        importedPublicKey = importPublicKeyReferenceFromDER(derFilePath)
-	}
+
+    convenience init(with derFilePath: String) throws {
+        self.init()
+        importedPublicKey = try? importPublicKey(fromDER: derFilePath)
+    }
+
+    convenience init(with p12FilePath: String, passPhrase: String) throws {
+        self.init()
+        importedPrivateKey = try? importPrivateKey(fromP12: p12FilePath, passPhrase: passPhrase)
+    }
+
 
     private func loadKey(name: String) -> SecKey? {
         let tag = name.data(using: .utf8) ?? Data()
@@ -121,41 +128,81 @@ class RSAWrapper: NSObject {
         }
 
     }
-	
-	/**
-	 * Extracts the public key from a X.509 certificate and returns a valid SecKeyRef that can be
-	 * used in any of SecKey operations (SecKeyEncrypt, SecKeyRawVerify...).
-	 * Receives the certificate data in DER format.
-	 */
-	private func importPublicKeyReferenceFromDER(_ certData: Data) -> SecKey? {
-		// first we create the certificate reference
-		guard let certRef = SecCertificateCreateWithData(nil, certData as CFData) else { return nil }
-		print("Successfully generated a valid certificate reference from the data.")
-		
-		// now create a SecTrust structure from the certificate where to extract the key from
-		var secTrust: SecTrust?
-		let secTrustStatus = SecTrustCreateWithCertificates(certRef, nil, &secTrust)
-		print("Generating a SecTrust reference from the certificate: \(secTrustStatus)")
-		if secTrustStatus != errSecSuccess { return nil }
-		
-		// now evaluate the certificate.
-		var resultType: SecTrustResultType = SecTrustResultType(rawValue: UInt32(0))! // result will be ignored.
-		let evaluateStatus = SecTrustEvaluate(secTrust!, &resultType)
-		print("Evaluating the obtained SecTrust reference: \(evaluateStatus)")
-		if evaluateStatus != errSecSuccess { return nil }
-		
-		// lastly, once evaluated, we can export the public key from the certificate leaf.
-		let publicKeyRef = SecTrustCopyPublicKey(secTrust!)
-		print("Got public key reference: \(String(describing: publicKeyRef))")
-		return publicKeyRef
-	}
-	
-	public func importPublicKey(from derFilePath: String) throws -> SecKey? {
-		guard let certData = try? Data(contentsOf: URL(fileURLWithPath: certPath)) else {
-			throw RSAErrors.noX509certificate
-		}
-		return importPublicKeyReferenceFromDER(certData)
-	}
+
+    /**
+     * Extracts the public key from a X.509 certificate and returns a valid SecKeyRef that can be
+     * used in any of SecKey operations .
+     */
+    private func getPublicKey(fromData certData: Data) -> SecKey? {
+
+        guard let certRef = SecCertificateCreateWithData(nil, certData as CFData) else { return nil }
+        print("Successfully generated a valid certificate reference from the data.")
+
+        // now create a SecTrust structure from the certificate where to extract the key from
+        var secTrust: SecTrust?
+        let secTrustStatus = SecTrustCreateWithCertificates(certRef, nil, &secTrust)
+        print("Generating a SecTrust reference from the certificate: \(secTrustStatus)")
+        if secTrustStatus != errSecSuccess { return nil }
+
+        // now evaluate the certificate.
+        var resultType: SecTrustResultType = SecTrustResultType(rawValue: UInt32(0))! // result will be ignored.
+        var error: CFError?
+        var evaluateStatus: OSStatus
+        var evaluateResult: Bool
+        if #available(iOS 13.0, *) {
+            evaluateResult = SecTrustEvaluateWithError(secTrust!, &error)
+        } else {
+            evaluateStatus = SecTrustEvaluate(secTrust!, &resultType)
+            evaluateResult = !(evaluateStatus == errSecSuccess)
+        }
+
+        if !evaluateResult { return nil }
+
+        // lastly, once evaluated, we can export the public key from the certificate leaf.
+        var publicKeyRef: SecKey?
+        if #available(iOS 14.0, *) {
+            publicKeyRef = SecTrustCopyKey(secTrust!)
+        } else {
+            publicKeyRef = SecTrustCopyPublicKey(secTrust!)
+        }
+        print("Got public key reference: \(String(describing: publicKeyRef))")
+        return publicKeyRef
+    }
+
+    private func getPrivateKey(fromData p12Data: Data, with passphrase: String = "") -> SecKey? {
+
+        var privateKeyRef: SecKey? = nil
+        let options = [kSecImportExportPassphrase as String: passphrase]
+        var rawItems: CFArray?
+        var status = SecPKCS12Import(
+            p12Data as CFData,
+            options as CFDictionary,
+            &rawItems)
+
+        if status == noErr && CFArrayGetCount(rawItems) > 0 {
+            let identityDict: CFDictionary = CFArrayGetValueAtIndex(rawItems, 0) as! CFDictionary
+            let identityApp: SecIdentity? = (CFDictionaryGetValue(identityDict, kSecImportItemIdentity as String) as! SecIdentity)
+            status = SecIdentityCopyPrivateKey(identityApp!, &privateKeyRef)
+            if !(status == noErr) {
+                privateKeyRef = nil;
+            }
+        }
+        return privateKeyRef
+    }
+
+    public func importPublicKey(fromDER derFilePath: String) throws -> SecKey? {
+        guard let certData = try? Data(contentsOf: URL(fileURLWithPath: derFilePath)) else {
+            throw RSAErrors.noX509certificate
+        }
+        return getPublicKey(fromData: certData)
+    }
+
+    public func importPrivateKey(fromP12 p12FilePath: String, passPhrase: String) throws -> SecKey? {
+        guard let certData = try? Data(contentsOf: URL(fileURLWithPath: p12FilePath)) else {
+            throw RSAErrors.noX509certificate
+        }
+        return getPrivateKey(fromData: certData, with: passPhrase)
+    }
 
     public func publicKeyAsPEM() throws -> String {
         // client public key to pem string
@@ -256,8 +303,8 @@ class RSAWrapper: NSObject {
         }
         return clearText
     }
-	
-	public func getExternalPublicKey() -> SecKey? {
-		importedPublicKey
-	}
+
+    public func getExternalPublicKey() -> SecKey? {
+        importedPublicKey
+    }
 }
