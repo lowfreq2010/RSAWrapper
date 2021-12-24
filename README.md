@@ -3,6 +3,8 @@ Wrapper class for handling all tasks related to RSA cryptography
 
 USAGE
 
+Just copy RSAWrapper.swift to your project and start using it as you need. Some examples are shown below:
+
 do {
 	let rsaWrapper = try RSAWrapper(with: .RSA2048 , privateTag: "your-private-tag-goes-here")
 
